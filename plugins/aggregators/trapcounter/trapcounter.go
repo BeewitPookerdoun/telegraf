@@ -23,6 +23,7 @@ type aggregate struct {
 }
 
 // TrapCounter an aggregation plugin
+type AggregateCache map[uint64]*aggregate
 type TrapCounter struct {
 	Identifiers []string    `toml:"identifiers"`
     ResetCounts bool        `toml:"reset"`
@@ -38,7 +39,7 @@ type TrapCounter struct {
 
 	client      *http.Client
 
-	cache       map[uint64]aggregate
+	cache       AggregateCache
 
     Log         telegraf.Logger
 }
@@ -65,13 +66,18 @@ var sampleConfig = `
   ## are periodically output
   identifiers = ["host", "source"]
 
+  ## Also initialize the "opposite" clear/raise value when receiving a
+  ## notification for the first time.
+  ## The regular expression to compare to an existing notification OID for
+  ## for formatting its opposite notification
+  clear_regexp = "^(.*)Clear$"
+
   ## Reset counters after every flush
   reset = false
 
   ## URL from which to read InfluxDB-formatted JSON
   ## Default is "http://localhost:8086/query".
   url = "http://localhost:8086/query"
-
   ## Database and measurement values used to build the LAST() query. The
   ## following values, in combination with the url and identifiers parameters above
   ## would build a final url: 
@@ -130,9 +136,29 @@ func (tc *TrapCounter) Add(in telegraf.Metric) {
 	// Check if this metric has a "name" tag. If so, increment its value's hit
     // count.
     if oid, ok := in.GetTag("name"); ok {
-        agg := tc.cache[id]
-        agg.trapCount[oid]++
-        agg.added = true
+        agg = tc.cache[id]
+        if _, ok = agg.trapCount[oid]; !ok {
+            // Initialize the notification OID's counter to 1
+            agg.trapCount[oid] = 1
+
+            // Initialize the OID's "opposite" to 0
+            if tc.ClearExpr == "" {
+                tc.ClearExpr = "^(.*)Clear$"
+            }
+            if tc.ClearRegexp == nil {
+                tc.ClearRegexp = regexp.MustCompile(tc.ClearExpr)
+            }
+            matches := tc.ClearRegexp.FindStringSubmatch(oid)
+            if matches == nil {
+                // Is a "raise", initialize "clear"
+            } else {
+                // Is a "clear", initialize "raise"
+                agg.trapCount[matches[1]] = 0
+            }
+        } else {
+            tc.cache[id].trapCount[oid]++
+        }
+        tc.cache[id].added = true
 	}
 }
 
@@ -140,6 +166,7 @@ func (tc *TrapCounter) Add(in telegraf.Metric) {
 func (tc *TrapCounter) Push(acc telegraf.Accumulator) {
 	for _, agg := range tc.cache {
         if agg.added {
+            tc.Log.Debugf("*PUSH* Sending aggregate %s to accumulator.", agg.tags)
             oids := map[string]interface{}{}
 
             for oid, count := range agg.trapCount {
@@ -147,14 +174,19 @@ func (tc *TrapCounter) Push(acc telegraf.Accumulator) {
             }
 
             acc.AddFields(agg.name, oids, agg.tags)
+        } else {
+            tc.Log.Debugf("*PUSH* No new metrics for aggregate %s.", agg.tags)
         }
 	}
 }
 
 // Reset the cache, executed after each push
 func (tc *TrapCounter) Reset() {
+    if tc.Log != nil {
+        tc.Log.Debugf("*RESET*")
+    }
     if tc.cache == nil {
-	    tc.cache = make(map[uint64]aggregate)
+	    tc.cache = make(AggregateCache)
     } else {
         for _, agg := range tc.cache {
             for oid, _ := range agg.trapCount {
@@ -167,13 +199,13 @@ func (tc *TrapCounter) Reset() {
     }
 }
 
-func (tc *TrapCounter) CreateAggregator(name string, tags map[string]string) aggregate {
+func (tc *TrapCounter) CreateAggregator(name string, tags map[string]string) *aggregate {
     filtered_tags := make(map[string]string)
     for _, tag := range tc.Identifiers {
         filtered_tags[tag] = tags[tag]
     }
 
-    a := aggregate{
+    a := &aggregate{
         name:       name,
         tags:       filtered_tags,
         trapCount:  make(map[string]int),
