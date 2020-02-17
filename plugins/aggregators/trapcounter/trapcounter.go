@@ -28,6 +28,9 @@ type TrapCounter struct {
 	Identifiers []string    `toml:"identifiers"`
     ResetCounts bool        `toml:"reset"`
 
+    RaisedToCleared map[string]string `toml:"alarms"`
+    ClearedToRaised map[string]string
+
     // Database connection parameters
 	URL         string            `toml:"url"`
     Database    string            `toml:"database"`
@@ -42,6 +45,8 @@ type TrapCounter struct {
 	cache       AggregateCache
 
     Log         telegraf.Logger
+
+    init        bool
 }
 
 // NewTrapCounter create a new aggregation plugin which counts the occurrences
@@ -68,9 +73,14 @@ var sampleConfig = `
 
   ## Also initialize the "opposite" clear/raise value when receiving a
   ## notification for the first time.
-  ## The regular expression to compare to an existing notification OID for
-  ## for formatting its opposite notification
-  clear_regexp = "^(.*)Clear$"
+  ## Unless the notification OID is found in an "alarms" table, its opposite
+  ## (alarm "raised" vs. "cleared") is determined by adding or removing the suffix
+  ## "Clear". For OIDs that don't follow this convention, add an "alarms" 
+  ## table with entries where the key is the "raised" OID and the value is the
+  ## "cleared" one. For example,
+  ##
+  ## [aggregators.trapcounter.alarms]
+  ##   anAlarmWasRaised = theAlarmIsNowInactive
 
   ## Reset counters after every flush
   reset = false
@@ -122,9 +132,17 @@ func (tc *TrapCounter) Add(in telegraf.Metric) {
     // Use metric's source address as cache key
 	id := tc.AggregateID(in.Tags())
 
+    // If the alarms table hasn't yet been initialized, do so now
+    if tc.ClearedToRaised == nil {
+        tc.ClearedToRaised = make(map[string]string)
+        for k, v := range tc.RaisedToCleared {
+            tc.ClearedToRaised[v] = k
+        }
+    }
+
 	// Check if the cache already has an entry for this metric, if not create it
 	if _, ok := tc.cache[id]; !ok {
-        tc.Log.Debugf("Failed to find an aggregate for %s. Creating one...", in.Tags())
+        tc.Log.Debugf("Creating new aggregate for %s...", in.Tags())
         tc.InitializeAggregators()
         // If still no aggregator, create one
         if _, ok := tc.cache[id]; !ok {
@@ -136,24 +154,28 @@ func (tc *TrapCounter) Add(in telegraf.Metric) {
 	// Check if this metric has a "name" tag. If so, increment its value's hit
     // count.
     if oid, ok := in.GetTag("name"); ok {
-        agg = tc.cache[id]
+        agg := tc.cache[id]
+        // If this is the first time this particular OID has been encountered,
+        // initialize its count to 1 and its opposite to 0.
         if _, ok = agg.trapCount[oid]; !ok {
-            // Initialize the notification OID's counter to 1
             agg.trapCount[oid] = 1
 
-            // Initialize the OID's "opposite" to 0
-            if tc.ClearExpr == "" {
-                tc.ClearExpr = "^(.*)Clear$"
-            }
-            if tc.ClearRegexp == nil {
-                tc.ClearRegexp = regexp.MustCompile(tc.ClearExpr)
-            }
-            matches := tc.ClearRegexp.FindStringSubmatch(oid)
-            if matches == nil {
-                // Is a "raise", initialize "clear"
+            // Is the OID in RaisedToCleared?
+            if cleared_oid, ok := tc.RaisedToCleared[oid]; ok {
+                tc.Log.Debugf("Found cleared OID '%s'", cleared_oid)
+                agg.trapCount[cleared_oid] = 0
+            // or ClearedToRaised?
+            } else if raised_oid, ok := tc.ClearedToRaised[oid]; ok {
+                tc.Log.Debugf("Found raised OID '%s'", raised_oid)
+                agg.trapCount[raised_oid] = 0
+            // or does it have the suffix "Clear"?
+            } else if strings.HasSuffix(oid, "Clear") {
+                tc.Log.Debug("Calculated raised OID")
+                agg.trapCount[strings.TrimSuffix(oid, "Clear")] = 0
+            // No? Then it's a notification that an alarm has been raised.
             } else {
-                // Is a "clear", initialize "raise"
-                agg.trapCount[matches[1]] = 0
+                tc.Log.Debug("Calculated cleared OID")
+                agg.trapCount[oid + "Clear"] = 0
             }
         } else {
             tc.cache[id].trapCount[oid]++
@@ -166,7 +188,6 @@ func (tc *TrapCounter) Add(in telegraf.Metric) {
 func (tc *TrapCounter) Push(acc telegraf.Accumulator) {
 	for _, agg := range tc.cache {
         if agg.added {
-            tc.Log.Debugf("*PUSH* Sending aggregate %s to accumulator.", agg.tags)
             oids := map[string]interface{}{}
 
             for oid, count := range agg.trapCount {
@@ -174,17 +195,12 @@ func (tc *TrapCounter) Push(acc telegraf.Accumulator) {
             }
 
             acc.AddFields(agg.name, oids, agg.tags)
-        } else {
-            tc.Log.Debugf("*PUSH* No new metrics for aggregate %s.", agg.tags)
         }
-	}
+    }
 }
 
 // Reset the cache, executed after each push
 func (tc *TrapCounter) Reset() {
-    if tc.Log != nil {
-        tc.Log.Debugf("*RESET*")
-    }
     if tc.cache == nil {
 	    tc.cache = make(AggregateCache)
     } else {
