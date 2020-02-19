@@ -28,8 +28,8 @@ type TrapCounter struct {
 	Identifiers []string    `toml:"identifiers"`
     ResetCounts bool        `toml:"reset"`
 
-    RaisedToCleared map[string]string `toml:"alarms"`
-    ClearedToRaised map[string]string
+    ResetOn         []string    `toml:"reset_on"`
+    DontReset       []string    `toml:"dont_reset"`
 
     // Database connection parameters
 	URL         string            `toml:"url"`
@@ -71,16 +71,22 @@ var sampleConfig = `
   ## are periodically output
   identifiers = ["host", "source"]
 
-  ## Also initialize the "opposite" clear/raise value when receiving a
-  ## notification for the first time.
-  ## Unless the notification OID is found in an "alarms" table, its opposite
-  ## (alarm "raised" vs. "cleared") is determined by adding or removing the suffix
-  ## "Clear". For OIDs that don't follow this convention, add an "alarms" 
-  ## table with entries where the key is the "raised" OID and the value is the
-  ## "cleared" one. For example,
+  ## The trapcounter plugin decrements counts (down to 0) when it receives a
+  ## "clear" notification.
+  ## Unless the notification OID is found in the "alarm_pairs" table, its
+  ## opposite ("raised" vs. "cleared") is determined by the presence/absence of
+  ## the suffix "Clear". For OIDs that don't follow this convention, add an
+  ## entry in the "alarm_pairs" table where the key is the "cleared" OID and
+  ## the value is the "raised" one. For example,
   ##
-  ## [aggregators.trapcounter.alarms]
-  ##   anAlarmWasRaised = theAlarmIsNowInactive
+  ## [aggregators.trapcounter.alarm_pairs]
+  ##   theAlarmIsNowInactive = anAlarmWasRaised
+  ##
+  ## The plugin resets all other counters to 0 if it receives any of the OIDs in
+  ## the reset_on array
+  reset_on = ["startupNotification"]
+  ## Except for the OIDs listed in the dont_reset array
+  dont_reset = ["processExitedNotification", "missedHeartbeatNotification", "execvFailedNotification"]
 
   ## Reset counters after every flush
   reset = false
@@ -127,18 +133,25 @@ func (tc *TrapCounter) AggregateID(tags map[string]string) uint64 {
     return h.Sum64()
 }
 
+func (tc *TrapCounter) GetRaisedOID(oid string) (string, bool) {
+    // Is oid in ClearedToRaised?
+    if raised_oid, ok := tc.ClearedToRaised[oid]; ok {
+        tc.Log.Debugf("OID '%s' found in ClearedToRaised", oid)
+        return raised_oid, true
+    // or does it have the suffix "Clear"?
+    } else if strings.HasSuffix(oid, "Clear") {
+        tc.Log.Debugf("OID '%s' has 'Clear' suffix", oid)
+        return strings.TrimSuffix(oid, "Clear"), true
+    // No? Then it's a notification that an alarm has been raised.
+    } else {
+        return oid, false
+    }
+}
+
 // Add is run on every metric which passes the plugin
 func (tc *TrapCounter) Add(in telegraf.Metric) {
     // Use metric's source address as cache key
 	id := tc.AggregateID(in.Tags())
-
-    // If the alarms table hasn't yet been initialized, do so now
-    if tc.ClearedToRaised == nil {
-        tc.ClearedToRaised = make(map[string]string)
-        for k, v := range tc.RaisedToCleared {
-            tc.ClearedToRaised[v] = k
-        }
-    }
 
 	// Check if the cache already has an entry for this metric, if not create it
 	if _, ok := tc.cache[id]; !ok {
@@ -150,37 +163,23 @@ func (tc *TrapCounter) Add(in telegraf.Metric) {
         }
 	}
 
-    // TODO: Parameterize "name"
+    // TODO: Parameterize "name"?
 	// Check if this metric has a "name" tag. If so, increment its value's hit
     // count.
     if oid, ok := in.GetTag("name"); ok {
         agg := tc.cache[id]
-        // If this is the first time this particular OID has been encountered,
-        // initialize its count to 1 and its opposite to 0.
-        if _, ok = agg.trapCount[oid]; !ok {
-            agg.trapCount[oid] = 1
 
-            // Is the OID in RaisedToCleared?
-            if cleared_oid, ok := tc.RaisedToCleared[oid]; ok {
-                tc.Log.Debugf("Found cleared OID '%s'", cleared_oid)
-                agg.trapCount[cleared_oid] = 0
-            // or ClearedToRaised?
-            } else if raised_oid, ok := tc.ClearedToRaised[oid]; ok {
-                tc.Log.Debugf("Found raised OID '%s'", raised_oid)
-                agg.trapCount[raised_oid] = 0
-            // or does it have the suffix "Clear"?
-            } else if strings.HasSuffix(oid, "Clear") {
-                tc.Log.Debug("Calculated raised OID")
-                agg.trapCount[strings.TrimSuffix(oid, "Clear")] = 0
-            // No? Then it's a notification that an alarm has been raised.
-            } else {
-                tc.Log.Debug("Calculated cleared OID")
-                agg.trapCount[oid + "Clear"] = 0
+        // Decrement trap count on clear (down to 0), increment on raise
+        raised_oid, is_clear := tc.GetRaisedOID(oid)
+        if is_clear {
+            if agg.trapCount[raised_oid] > 0 {
+                agg.trapCount[raised_oid]--
             }
         } else {
-            tc.cache[id].trapCount[oid]++
+            agg.trapCount[raised_oid]++
         }
-        tc.cache[id].added = true
+
+        agg.added = true
 	}
 }
 
@@ -235,24 +234,6 @@ func (tc *TrapCounter) CreateAggregator(name string, tags map[string]string) *ag
 func (tc *TrapCounter) InitializeAggregators() {
     // Query database for initial counter values, which are the LAST() values in
     // the trap counting measurement
-
-    // Set default url
-	if tc.URL == "" {
-		tc.URL = "http://localhost:8086/query"
-	}
-
-    if len(tc.Identifiers) == 0 {
-        tc.Identifiers[0] = "host"
-        tc.Identifiers[1] = "source"
-    }
-
-    if tc.Measurement == "" {
-        tc.Measurement = "snmp_trap"
-    }
-
-    if tc.Database == "" {
-        tc.Database = "telegraf"
-    }
 
     // Create client
 	if tc.client == nil {
@@ -393,7 +374,15 @@ func (tc *TrapCounter) InitializeAggregators() {
 
 func init() {
 	aggregators.Add("trapcounter", func() telegraf.Aggregator {
-		return NewTrapCounter()
+		return NewTrapCounter(
+            ResetOn: ["startupNotification"]
+            DontReset: ["processExitedNotification",
+                "missedHeartbeatNotification", "execvFailedNotification"]
+            URL: "http://localhost:8086/query"
+            Identifiers: ["host", "source"]
+            Measurement: "snmp_trap"
+            Database: "telegraf"
+        )
 	})
 }
 
