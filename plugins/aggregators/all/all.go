@@ -10,5 +10,6 @@ import (
 	_ "github.com/influxdata/telegraf/plugins/aggregators/minmax"
 	_ "github.com/influxdata/telegraf/plugins/aggregators/quantile"
 	_ "github.com/influxdata/telegraf/plugins/aggregators/valuecounter"
-	_ "github.com/influxdata/telegraf/plugins/aggregators/trapcounter"
+	_ "github.com/influxdata/telegraf/plugins/aggregators/tagcounter"
+    _ "github.com/influxdata/telegraf/plugins/aggregators/alarmtracker"
 )
