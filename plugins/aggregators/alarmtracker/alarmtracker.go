@@ -1,4 +1,4 @@
-package alarmtracker 
+package alarmtracker
 
 import (
     "bytes"
@@ -70,7 +70,7 @@ const (
 
 type Tracker struct {
 	tags        map[string]string
-	alarmStatus map[string]bool
+	alarmStatus map[string]int
 
     plugin      *AlarmTracker
     updated     bool
@@ -79,16 +79,16 @@ type TrackerCache map[uint64]*Tracker
 
 func (self *Tracker) Reset() {
     for alarm, status := range self.alarmStatus {
-        if status {
+        if status != 0 {
             self.plugin.Log.Debugf("Reseting '%s'", alarm)
-            self.alarmStatus[alarm] = false
+            self.alarmStatus[alarm] = 0
             self.updated = true
         }
     }
 }
 
 // Tracker.alarmStatus tracks whether an alarm is active by mapping the OID of a
-// alarm status change notification to a bool.
+// alarm status change notification to an integer representing a bool (1 or 0).
 func (self *Tracker) SetAlarmStatus(oid string) {
     raised_oid := ""
     var ok, is_raised bool
@@ -118,8 +118,12 @@ func (self *Tracker) SetAlarmStatus(oid string) {
     }
 
     if raised_oid != "" {
-        if self.alarmStatus[raised_oid] != is_raised {
-            self.alarmStatus[raised_oid] = is_raised
+        if (self.alarmStatus[raised_oid] != 0) != is_raised {
+            if is_raised {
+                self.alarmStatus[raised_oid] = 1
+            } else {
+                self.alarmStatus[raised_oid] = 0
+            }
             self.updated = true
         }
     }
@@ -265,7 +269,7 @@ func (self *AlarmTracker) CreateTracker(tags map[string]string) *Tracker {
 
     tracker := &Tracker{
         tags:           filtered_tags,
-        alarmStatus:    make(map[string]bool),
+        alarmStatus:    make(map[string]int),
         plugin:         self,
         updated:        false,
     }
@@ -400,18 +404,11 @@ func (self *AlarmTracker) InitializeTrackers() {
                 alarm := strings.TrimPrefix(col, "last_")
                 switch v := series.Values[0][i].(type) {
                     case float64:
-                        tracker.alarmStatus[alarm] = int(v) != 0
-                        log_entry += alarm + "= (" + string(int(v)) + " != 0)"
-                    case bool:
-                        tracker.alarmStatus[alarm] = bool(v)
-                        if bool(v) {
-                            log_entry += alarm + "= true"
-                        } else {
-                            log_entry += alarm + "= false"
-                        }
+                        tracker.alarmStatus[alarm] = int(v)
+                        log_entry += alarm + "= " + string(int(v))
                     default:
-                        tracker.alarmStatus[alarm] = false
-                        log_entry += alarm + "= false"
+                        tracker.alarmStatus[alarm] = 0
+                        log_entry += alarm + "= 0"
                 }
             }
         }
